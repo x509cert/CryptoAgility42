@@ -2,10 +2,10 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- net8.0 is the floor: AesGcm's explicit-tag-size ctor and the span
-         Pbkdf2/HashData overloads are all present. Bump to net9.0/net10.0
-         freely — nothing here is version-gated above 8. -->
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- net10.0 keeps the sample on the current platform and lets us use the
+         built-in AES-KWP (RFC 5649) key-wrap APIs (Aes.EncryptKeyWrapPadded /
+         Aes.DecryptKeyWrapPadded). -->
+    <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
 
     <Nullable>enable</Nullable>

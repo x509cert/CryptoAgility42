@@ -11,14 +11,22 @@ static int Run(string[] args)
         return args.Length == 0 ? 1 : 0;
     }
 
+    string command = args[0].ToLowerInvariant();
+
     try
     {
-        return args[0].ToLowerInvariant() switch
+        return command switch
         {
             "encrypt" => EncryptFile(args),
             "decrypt" => DecryptFile(args),
+            "inspect" => InspectFile(args),
             _ => UsageError($"Unknown command '{args[0]}'."),
         };
+    }
+    catch (CryptographicException ex) when (command == "inspect")
+    {
+        Console.Error.WriteLine($"Inspect failed: {ex.Message}");
+        return 2;
     }
     catch (CryptographicException)
     {
@@ -57,23 +65,38 @@ static int EncryptFile(string[] args)
 
 static int DecryptFile(string[] args)
 {
-    if (args.Length != 2)
-        return UsageError("decrypt requires: <filename.enc>");
+    if (args.Length != 3)
+        return UsageError("decrypt requires: <password> <filename.enc>");
 
-    string inputPath = args[1];
+    string password = args[1];
+    string inputPath = args[2];
     string outputPath = GetDecryptedPath(inputPath);
 
     if (!File.Exists(inputPath))
         throw new FileNotFoundException($"Input file not found: {inputPath}", inputPath);
     if (File.Exists(outputPath))
-        throw new IOException($"Output file already exists: {outputPath}");
+        throw new IOException($"Output file already exists: {outputPath}. Delete or rename it before decrypting.");
 
-    string password = ReadPassword("Password: ");
     byte[] encrypted = File.ReadAllBytes(inputPath);
     byte[] plaintext = CryptoBlob.Decrypt(encrypted, password);
     WriteNewFile(outputPath, plaintext);
 
     Console.WriteLine($"Decrypted {inputPath} to {outputPath}.");
+    return 0;
+}
+
+static int InspectFile(string[] args)
+{
+    if (args.Length != 2)
+        return UsageError("inspect requires: <filename.enc>");
+
+    string inputPath = args[1];
+    if (!File.Exists(inputPath))
+        throw new FileNotFoundException($"Input file not found: {inputPath}", inputPath);
+
+    byte[] encrypted = File.ReadAllBytes(inputPath);
+    CryptoBlobHeader header = CryptoBlob.Inspect(encrypted);
+    PrintHeader(inputPath, header);
     return 0;
 }
 
@@ -106,34 +129,6 @@ static void WriteNewFile(string outputPath, byte[] contents)
     }
 }
 
-static string ReadPassword(string prompt)
-{
-    Console.Error.Write(prompt);
-    if (Console.IsInputRedirected)
-        return Console.ReadLine() ?? string.Empty;
-
-    var password = new List<char>();
-    while (true)
-    {
-        ConsoleKeyInfo key = Console.ReadKey(intercept: true);
-        if (key.Key == ConsoleKey.Enter)
-        {
-            Console.Error.WriteLine();
-            return new string(password.ToArray());
-        }
-
-        if (key.Key == ConsoleKey.Backspace)
-        {
-            if (password.Count > 0)
-                password.RemoveAt(password.Count - 1);
-            continue;
-        }
-
-        if (!char.IsControl(key.KeyChar))
-            password.Add(key.KeyChar);
-    }
-}
-
 static int UsageError(string message)
 {
     Console.Error.WriteLine(message);
@@ -141,17 +136,37 @@ static int UsageError(string message)
     return 1;
 }
 
+static void PrintHeader(string inputPath, CryptoBlobHeader header)
+{
+    Console.WriteLine($"File: {inputPath}");
+    Console.WriteLine($"Magic: {header.Magic}");
+    Console.WriteLine($"Version: v{(byte)header.Version}");
+    Console.WriteLine($"Password KDF: {header.PasswordKdf}");
+    Console.WriteLine($"Iterations: {header.Iterations}");
+    Console.WriteLine($"Salt: {Convert.ToHexString(header.Salt)}");
+    Console.WriteLine($"{header.IvOrNonceName}: {Convert.ToHexString(header.IvOrNonce)}");
+    Console.WriteLine($"Key wrap: {header.KeyWrap}");
+    Console.WriteLine($"Content encryption: {header.ContentEncryption}");
+    Console.WriteLine($"Authentication: {header.Authentication}");
+    Console.WriteLine($"Header length: {header.HeaderLength} bytes");
+    Console.WriteLine($"Wrapped DEK length: {header.WrappedDekLength} bytes");
+    Console.WriteLine($"Ciphertext length: {header.CiphertextLength} bytes");
+    Console.WriteLine($"{header.AuthDataName} length: {header.AuthDataLength} bytes");
+}
+
 static void PrintUsage()
 {
     Console.Error.WriteLine("""
         Usage:
           Crypto encrypt <v1|v2|v3> <password> <filename>
-          Crypto decrypt <filename.enc>
+          Crypto decrypt <password> <filename.enc>
+          Crypto inspect <filename.enc>
 
         encrypt writes <filename>.enc and stores the format magic, version, PBKDF2
         iteration count, salt, IV or nonce, wrapped DEK, ciphertext, and auth tag.
-        decrypt prompts for the password and writes the original filename by removing
+        decrypt writes the original filename by removing
         the .enc suffix, or appends .dec when the input name does not end in .enc.
+        inspect prints the public crypto header metadata without decrypting.
         Existing output files are not overwritten.
         """);
 }

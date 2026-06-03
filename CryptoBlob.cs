@@ -4,243 +4,190 @@ using System.Security.Cryptography;
 namespace Crypto;
 
 /// <summary>
-/// Cryptographic algorithm selection by security version.
+/// Two-tier crypto. A random per-message DEK encrypts the payload; a password-derived
+/// KEK wraps the DEK with AES-KWP (RFC 5649) via <see cref="Aes.EncryptKeyWrapPadded(ReadOnlySpan{byte})"/>.
+/// v1: PBKDF2-SHA1 / AES-128-CBC / HMAC-SHA1 (encrypt-then-MAC) — legacy compat.
+/// v2: PBKDF2-SHA256 / AES-128-GCM (header is GCM AAD).
+/// v3: PBKDF2-SHA384 / AES-256-GCM (header is GCM AAD); key sizes doubled for post-Grover margin.
 ///
-/// Two-layer key hierarchy in every version:
-///   DEK (data encryption key) — encrypts the payload; random, per-message.
-///   KEK (key encryption key)  — wraps the DEK; derived from the password via PBKDF2.
-/// The DEK is never stored or transmitted in plaintext. Key wrapping is AES-KW (RFC 3394).
-///
-/// Wire format — magic, version byte, common metadata, then version-specific metadata and body:
-///
-///   v1 [magic:4][ver:1][iter:4][salt:16][iv:16][wrappedDek:24][ciphertext:..][hmacSha1:20]
-///        PBKDF2-SHA1 → KEK(16)‖MacKey(16); AES-128-KW; AES-128-CBC; encrypt-then-MAC.
-///        HMAC covers everything before it (header + ciphertext).
-///
-///   v2 [magic:4][ver:1][iter:4][salt:16][nonce:12][wrappedDek:24][ciphertext:..][gcmTag:16]
-///        PBKDF2-SHA256 → KEK(16); AES-128-KW; AES-128-GCM. Header is GCM-AAD.
-///
-///   v3 [magic:4][ver:1][iter:4][salt:16][nonce:12][wrappedDek:40][ciphertext:..][gcmTag:16]
-///        PBKDF2-SHA384 → KEK(32); AES-256-KW; AES-256-GCM. Header is GCM-AAD.
-///        Grover halves symmetric strength → key sizes doubled. No asymmetric/KEM ops.
-///
-/// AES-KW (RFC 3394) adds one 64-bit integrity block: a 16-byte key wraps to 24,
-/// a 32-byte key wraps to 40.
+/// Wire: [magic:4][ver:1][iter:4][salt:16][iv|nonce][wrappedDek][ciphertext][auth].
+/// iv=16B (v1, CBC) / nonce=12B (v2/v3, GCM); wrappedDek=24B (v1/v2) or 40B (v3);
+/// auth=20B HMAC-SHA1 (v1) or 16B GCM tag (v2/v3).
 /// </summary>
-public enum CryptoVersion : byte
+public enum CryptoVersion : byte { V1 = 1, V2 = 2, V3 = 3, Latest = V3 }
+
+public sealed record CryptoBlobHeader(
+    CryptoVersion Version, int Iterations, byte[] Salt, byte[] IvOrNonce,
+    int HeaderLength, int WrappedDekOffset, int WrappedDekLength,
+    int CiphertextLength, int AuthDataLength)
 {
-    V1     = 1,
-    V2     = 2,
-    V3     = 3,
-    Latest = V3,
+    public string Magic { get; } = "CA42";
+    public string PasswordKdf => $"PBKDF2-{HashName}";
+    public string IvOrNonceName => Version == CryptoVersion.V1 ? "IV" : "Nonce";
+    public string KeyWrap => $"AES-{KeyBits}-KWP (RFC 5649)";
+    public string ContentEncryption => Version == CryptoVersion.V1
+        ? "AES-128-CBC with PKCS#7 padding" : $"AES-{KeyBits}-GCM";
+    public string Authentication => Version == CryptoVersion.V1
+        ? "HMAC-SHA1, encrypt-then-MAC" : "AES-GCM tag";
+    public string AuthDataName => Version == CryptoVersion.V1 ? "HMAC-SHA1" : "GCM tag";
+
+    private string HashName => Version switch
+    {
+        CryptoVersion.V1 => "SHA1",
+        CryptoVersion.V2 => "SHA256",
+        _ => "SHA384",
+    };
+    private int KeyBits => Version == CryptoVersion.V3 ? 256 : 128;
 }
 
 public static class CryptoBlob
 {
-    private const int MagicLen = 4;
-    private const int IterationLen = 4;
-    private const int SaltLen  = 16;   // 128-bit salt (all versions)
-    private const int IvLen     = 16;  // AES-CBC IV (v1)
-    private const int NonceLen  = 12;  // 96-bit GCM nonce (v2/v3)
-    private const int TagLen     = 16; // AES-GCM tag (v2/v3)
-    private const int MacLen     = 20; // HMAC-SHA1 (v1)
-    private const int MinIterations = 1_000;
-    private const int MaxIterations = 1_000_000;
+    private const int MagicLen = 4, IterLen = 4, SaltLen = 16,
+                      IvLen = 16, NonceLen = 12, TagLen = 16, MacLen = 20,
+                      MinIter = 1_000, MaxIter = 1_000_000;
+    private const int Prefix = MagicLen + 1 + IterLen + SaltLen; // magic|ver|iter|salt
 
     private static ReadOnlySpan<byte> Magic => "CA42"u8;
-
-    // ── Public API ────────────────────────────────────────────────────────────
 
     public static byte[] Encrypt(ReadOnlySpan<byte> plaintext, ReadOnlySpan<char> password,
                                  CryptoVersion version = CryptoVersion.Latest) => version switch
     {
         CryptoVersion.V1 => EncryptV1(plaintext, password),
-        CryptoVersion.V2 => EncryptGcm(plaintext, password, CryptoVersion.V2),
-        CryptoVersion.V3 => EncryptGcm(plaintext, password, CryptoVersion.V3),
+        CryptoVersion.V2 or CryptoVersion.V3 => EncryptGcm(plaintext, password, version),
         _ => throw new ArgumentOutOfRangeException(nameof(version), version, "Unknown crypto version."),
     };
 
     public static byte[] Decrypt(ReadOnlySpan<byte> blob, ReadOnlySpan<char> password)
     {
-        if (blob.Length < MagicLen + 1)
-            throw new ArgumentException("Blob is too short.", nameof(blob));
-
-        if (!blob[..MagicLen].SequenceEqual(Magic))
-            throw new CryptographicException("Unsupported blob format.");
-
-        return (CryptoVersion)blob[MagicLen] switch
-        {
-            CryptoVersion.V1 => DecryptV1(blob, password),
-            CryptoVersion.V2 => DecryptGcm(blob, password, CryptoVersion.V2),
-            CryptoVersion.V3 => DecryptGcm(blob, password, CryptoVersion.V3),
-            var v => throw new CryptographicException($"Unsupported blob version {(byte)v}."),
-        };
+        var h = ParseHeader(blob);
+        return h.Version == CryptoVersion.V1
+            ? DecryptV1(blob, password, h)
+            : DecryptGcm(blob, password, h);
     }
 
-    // ── v1: PBKDF2-SHA1 / AES-128-KW / AES-128-CBC / HMAC-SHA1 ──────────────────
+    public static CryptoBlobHeader Inspect(ReadOnlySpan<byte> blob) => ParseHeader(blob);
 
+    // ── v1: AES-128-CBC + HMAC-SHA1 (encrypt-then-MAC) ─────────────────────────
     private static byte[] EncryptV1(ReadOnlySpan<byte> plaintext, ReadOnlySpan<char> password)
     {
-        var (iterations, hash, keyLen) = Params(CryptoVersion.V1);
+        var (iter, hash, keyLen) = Params(CryptoVersion.V1);
 
         Span<byte> salt = stackalloc byte[SaltLen];
-        Span<byte> iv   = stackalloc byte[IvLen];
+        Span<byte> iv = stackalloc byte[IvLen];
         RandomNumberGenerator.Fill(salt);
         RandomNumberGenerator.Fill(iv);
 
         // PBKDF2 output is split into KEK ‖ MAC key (key separation).
-        Span<byte> keyMaterial = stackalloc byte[16 + 16];
-        Rfc2898DeriveBytes.Pbkdf2(password, salt, keyMaterial, iterations, hash);
-        ReadOnlySpan<byte> kek    = keyMaterial[..keyLen];
-        ReadOnlySpan<byte> macKey = keyMaterial[keyLen..];
+        Span<byte> km = stackalloc byte[keyLen * 2];
+        Rfc2898DeriveBytes.Pbkdf2(password, salt, km, iter, hash);
 
         Span<byte> dek = stackalloc byte[16];
         RandomNumberGenerator.Fill(dek);
-        byte[] wrappedDek = AesKw.Wrap(kek, dek);   // 24 bytes
+        byte[] wrapped = WrapDek(km[..keyLen], dek);
 
         using var aes = Aes.Create();
         aes.Key = dek.ToArray();
-        byte[] ciphertext = aes.EncryptCbc(plaintext, iv, PaddingMode.PKCS7);
+        byte[] ct = aes.EncryptCbc(plaintext, iv, PaddingMode.PKCS7);
 
-        int bodyLen = MagicLen + 1 + IterationLen + SaltLen + IvLen + wrappedDek.Length + ciphertext.Length;
+        int headerLen = Prefix + IvLen + wrapped.Length;
+        int bodyLen = headerLen + ct.Length;
         var blob = new byte[bodyLen + MacLen];
-        var w = new SpanWriter(blob);
-        w.Write(Magic);
-        w.Byte((byte)CryptoVersion.V1);
-        w.Int32(iterations);
-        w.Write(salt);
-        w.Write(iv);
-        w.Write(wrappedDek);
-        w.Write(ciphertext);
+        WriteHeader(blob, CryptoVersion.V1, iter, salt, iv, wrapped);
+        ct.CopyTo(blob.AsSpan(headerLen));
 
-        // Encrypt-then-MAC over the entire body, tag appended at the end.
-        // CA5350: HMAC-SHA1 is intentional here — v1 is the legacy-compat tier only.
-#pragma warning disable CA5350
-        HMACSHA1.HashData(macKey, blob.AsSpan(0, bodyLen), blob.AsSpan(bodyLen, MacLen));
+#pragma warning disable CA5350 // HMAC-SHA1 intentional in legacy v1 tier
+        HMACSHA1.HashData(km[keyLen..], blob.AsSpan(0, bodyLen), blob.AsSpan(bodyLen, MacLen));
 #pragma warning restore CA5350
 
         CryptographicOperations.ZeroMemory(dek);
-        CryptographicOperations.ZeroMemory(keyMaterial);
+        CryptographicOperations.ZeroMemory(km);
         return blob;
     }
 
-    private static byte[] DecryptV1(ReadOnlySpan<byte> blob, ReadOnlySpan<char> password)
+    private static byte[] DecryptV1(ReadOnlySpan<byte> blob, ReadOnlySpan<char> password, CryptoBlobHeader h)
     {
-        if (blob.Length < MagicLen + 1 + IterationLen + SaltLen + IvLen + 24 + MacLen)
-            throw new CryptographicException("v1 blob is truncated.");
-
-        var r = new SpanReader(blob[(MagicLen + 1)..]);
-        int iterations = ValidateIterations(r.Take(IterationLen), CryptoVersion.V1);
-        ReadOnlySpan<byte> salt       = r.Take(SaltLen);
-        ReadOnlySpan<byte> iv         = r.Take(IvLen);
-        ReadOnlySpan<byte> wrappedDek = r.Take(24);
-        ReadOnlySpan<byte> ciphertext = r.Rest[..^MacLen];
-        ReadOnlySpan<byte> storedMac  = blob[^MacLen..];
-
         var (_, hash, keyLen) = Params(CryptoVersion.V1);
-        Span<byte> keyMaterial = stackalloc byte[16 + 16];
-        Rfc2898DeriveBytes.Pbkdf2(password, salt, keyMaterial, iterations, hash);
-        ReadOnlySpan<byte> kek    = keyMaterial[..keyLen];
-        ReadOnlySpan<byte> macKey = keyMaterial[keyLen..];
+        var wrapped = blob.Slice(h.WrappedDekOffset, h.WrappedDekLength);
+        var ct = blob.Slice(h.HeaderLength, h.CiphertextLength);
+        var storedMac = blob.Slice(h.HeaderLength + h.CiphertextLength, h.AuthDataLength);
 
-        // Verify MAC over the body (everything except the trailing tag) before touching keys.
-        // CA5350: HMAC-SHA1 is intentional here — v1 is the legacy-compat tier only.
-        Span<byte> computedMac = stackalloc byte[MacLen];
+        Span<byte> km = stackalloc byte[keyLen * 2];
+        Rfc2898DeriveBytes.Pbkdf2(password, h.Salt, km, h.Iterations, hash);
+
+        // Verify MAC over header+ciphertext before touching keys.
+        Span<byte> mac = stackalloc byte[MacLen];
 #pragma warning disable CA5350
-        HMACSHA1.HashData(macKey, blob[..^MacLen], computedMac);
+        HMACSHA1.HashData(km[keyLen..], blob[..(h.HeaderLength + h.CiphertextLength)], mac);
 #pragma warning restore CA5350
-        if (!CryptographicOperations.FixedTimeEquals(computedMac, storedMac))
+        if (!CryptographicOperations.FixedTimeEquals(mac, storedMac))
         {
-            CryptographicOperations.ZeroMemory(keyMaterial);
+            CryptographicOperations.ZeroMemory(km);
             throw new CryptographicException("v1 HMAC verification failed — blob corrupt, tampered, or wrong password.");
         }
 
-        byte[] dek = AesKw.Unwrap(kek, wrappedDek);
+        byte[] dek = UnwrapDek(km[..keyLen], wrapped);
         try
         {
             using var aes = Aes.Create();
             aes.Key = dek;
-            return aes.DecryptCbc(ciphertext, iv, PaddingMode.PKCS7);
+            return aes.DecryptCbc(ct, h.IvOrNonce, PaddingMode.PKCS7);
         }
         finally
         {
             CryptographicOperations.ZeroMemory(dek);
-            CryptographicOperations.ZeroMemory(keyMaterial);
+            CryptographicOperations.ZeroMemory(km);
         }
     }
 
-    // ── v2 / v3: PBKDF2 / AES-KW / AES-GCM (header authenticated as AAD) ─────────
-
+    // ── v2/v3: AES-GCM (header is GCM AAD) ─────────────────────────────────────
     private static byte[] EncryptGcm(ReadOnlySpan<byte> plaintext, ReadOnlySpan<char> password, CryptoVersion version)
     {
-        var (iterations, hash, keyLen) = Params(version);
+        var (iter, hash, keyLen) = Params(version);
 
-        Span<byte> salt  = stackalloc byte[SaltLen];
+        Span<byte> salt = stackalloc byte[SaltLen];
         Span<byte> nonce = stackalloc byte[NonceLen];
         RandomNumberGenerator.Fill(salt);
         RandomNumberGenerator.Fill(nonce);
 
-        Span<byte> kek = stackalloc byte[32];                 // sized for the largest version
-        Rfc2898DeriveBytes.Pbkdf2(password, salt, kek[..keyLen], iterations, hash);
+        Span<byte> kek = stackalloc byte[32]; // sized for the largest version
+        Rfc2898DeriveBytes.Pbkdf2(password, salt, kek[..keyLen], iter, hash);
 
         Span<byte> dek = stackalloc byte[32];
         RandomNumberGenerator.Fill(dek[..keyLen]);
-        byte[] wrappedDek = AesKw.Wrap(kek[..keyLen], dek[..keyLen]);   // 24 or 40 bytes
+        byte[] wrapped = WrapDek(kek[..keyLen], dek[..keyLen]);
 
-        int headerLen = MagicLen + 1 + IterationLen + SaltLen + NonceLen + wrappedDek.Length;
+        int headerLen = Prefix + NonceLen + wrapped.Length;
         var blob = new byte[headerLen + plaintext.Length + TagLen];
-
-        var w = new SpanWriter(blob);
-        w.Write(Magic);
-        w.Byte((byte)version);
-        w.Int32(iterations);
-        w.Write(salt);
-        w.Write(nonce);
-        w.Write(wrappedDek);
-
-        // Bind the whole header to the ciphertext via AAD; write ct + tag straight into the blob.
-        ReadOnlySpan<byte> aad = blob.AsSpan(0, headerLen);
-        Span<byte> ctDst  = blob.AsSpan(headerLen, plaintext.Length);
-        Span<byte> tagDst = blob.AsSpan(headerLen + plaintext.Length, TagLen);
+        WriteHeader(blob, version, iter, salt, nonce, wrapped);
 
         using var gcm = new AesGcm(dek[..keyLen], TagLen);
-        gcm.Encrypt(nonce, plaintext, ctDst, tagDst, aad);
+        gcm.Encrypt(nonce, plaintext,
+            blob.AsSpan(headerLen, plaintext.Length),
+            blob.AsSpan(headerLen + plaintext.Length, TagLen),
+            blob.AsSpan(0, headerLen));
 
         CryptographicOperations.ZeroMemory(dek);
         CryptographicOperations.ZeroMemory(kek);
         return blob;
     }
 
-    private static byte[] DecryptGcm(ReadOnlySpan<byte> blob, ReadOnlySpan<char> password, CryptoVersion version)
+    private static byte[] DecryptGcm(ReadOnlySpan<byte> blob, ReadOnlySpan<char> password, CryptoBlobHeader h)
     {
-        var (_, hash, keyLen) = Params(version);
-        int wrappedLen = keyLen + 8;   // RFC 3394 overhead
-
-        if (blob.Length < MagicLen + 1 + IterationLen + SaltLen + NonceLen + wrappedLen + TagLen)
-            throw new CryptographicException($"{version} blob is truncated.");
-
-        var r = new SpanReader(blob[(MagicLen + 1)..]);
-        int iterations = ValidateIterations(r.Take(IterationLen), version);
-        ReadOnlySpan<byte> salt       = r.Take(SaltLen);
-        ReadOnlySpan<byte> nonce      = r.Take(NonceLen);
-        ReadOnlySpan<byte> wrappedDek = r.Take(wrappedLen);
-        int headerLen = MagicLen + 1 + IterationLen + SaltLen + NonceLen + wrappedLen;
-
-        ReadOnlySpan<byte> body = r.Rest;
-        ReadOnlySpan<byte> ciphertext = body[..^TagLen];
-        ReadOnlySpan<byte> tag        = body[^TagLen..];
-        ReadOnlySpan<byte> aad        = blob[..headerLen];
+        var (_, hash, keyLen) = Params(h.Version);
+        var wrapped = blob.Slice(h.WrappedDekOffset, h.WrappedDekLength);
+        var ct = blob.Slice(h.HeaderLength, h.CiphertextLength);
+        var tag = blob.Slice(h.HeaderLength + h.CiphertextLength, h.AuthDataLength);
 
         Span<byte> kek = stackalloc byte[32];
-        Rfc2898DeriveBytes.Pbkdf2(password, salt, kek[..keyLen], iterations, hash);
+        Rfc2898DeriveBytes.Pbkdf2(password, h.Salt, kek[..keyLen], h.Iterations, hash);
 
-        byte[] dek = AesKw.Unwrap(kek[..keyLen], wrappedDek);
+        byte[] dek = UnwrapDek(kek[..keyLen], wrapped);
         try
         {
-            var plaintext = new byte[ciphertext.Length];
+            var pt = new byte[ct.Length];
             using var gcm = new AesGcm(dek, TagLen);
-            gcm.Decrypt(nonce, ciphertext, tag, plaintext, aad);   // throws on auth failure
-            return plaintext;
+            gcm.Decrypt(h.IvOrNonce, ct, tag, pt, blob[..h.HeaderLength]); // throws on auth failure
+            return pt;
         }
         finally
         {
@@ -249,141 +196,70 @@ public static class CryptoBlob
         }
     }
 
-    private static int ValidateIterations(ReadOnlySpan<byte> encodedIterations, CryptoVersion version)
+    private static CryptoBlobHeader ParseHeader(ReadOnlySpan<byte> blob)
     {
-        int iterations = BinaryPrimitives.ReadInt32BigEndian(encodedIterations);
-        if (iterations is < MinIterations or > MaxIterations)
+        if (blob.Length < MagicLen + 1 || !blob[..MagicLen].SequenceEqual(Magic))
+            throw new CryptographicException("Unsupported blob format.");
+
+        var version = (CryptoVersion)blob[MagicLen];
+        if (version is not (CryptoVersion.V1 or CryptoVersion.V2 or CryptoVersion.V3))
+            throw new CryptographicException($"Unsupported blob version {(byte)version}.");
+
+        var (_, _, keyLen) = Params(version);
+        int ivLen = version == CryptoVersion.V1 ? IvLen : NonceLen;
+        int authLen = version == CryptoVersion.V1 ? MacLen : TagLen;
+        int wrappedLen = keyLen + 8; // RFC 5649 AIV / integrity block
+        int headerLen = Prefix + ivLen + wrappedLen;
+
+        if (blob.Length < headerLen + authLen)
+            throw new CryptographicException($"{version} blob is truncated.");
+
+        int iter = BinaryPrimitives.ReadInt32BigEndian(blob.Slice(MagicLen + 1, IterLen));
+        if (iter is < MinIter or > MaxIter)
             throw new CryptographicException($"{version} PBKDF2 iteration count is outside the supported range.");
 
-        return iterations;
+        return new CryptoBlobHeader(
+            Version: version,
+            Iterations: iter,
+            Salt: blob.Slice(MagicLen + 1 + IterLen, SaltLen).ToArray(),
+            IvOrNonce: blob.Slice(Prefix, ivLen).ToArray(),
+            HeaderLength: headerLen,
+            WrappedDekOffset: Prefix + ivLen,
+            WrappedDekLength: wrappedLen,
+            CiphertextLength: blob.Length - headerLen - authLen,
+            AuthDataLength: authLen);
     }
 
-    private static (int Iterations, HashAlgorithmName Hash, int KeyLen) Params(CryptoVersion v) => v switch
+    private static (int Iter, HashAlgorithmName Hash, int KeyLen) Params(CryptoVersion v) => v switch
     {
         CryptoVersion.V1 => (10_000, HashAlgorithmName.SHA1, 16),
         CryptoVersion.V2 => (100_000, HashAlgorithmName.SHA256, 16),
         CryptoVersion.V3 => (300_000, HashAlgorithmName.SHA384, 32),
         _ => throw new ArgumentOutOfRangeException(nameof(v)),
     };
-}
 
-/// <summary>
-/// AES Key Wrap, RFC 3394. Implemented directly on the AES block primitive so there is
-/// no dependency on any specific BCL key-wrap surface. Wraps/unwraps keys that are a
-/// positive multiple of 8 bytes; output is the input plus one 64-bit integrity block.
-/// </summary>
-internal static class AesKw
-{
-    private const ulong DefaultIv = 0xA6A6A6A6A6A6A6A6UL;
-
-    public static byte[] Wrap(ReadOnlySpan<byte> kek, ReadOnlySpan<byte> key)
+    private static void WriteHeader(Span<byte> dst, CryptoVersion version, int iter,
+        ReadOnlySpan<byte> salt, ReadOnlySpan<byte> ivOrNonce, ReadOnlySpan<byte> wrapped)
     {
-        if (key.Length is 0 || key.Length % 8 != 0)
-            throw new ArgumentException("Key to wrap must be a positive multiple of 8 bytes.", nameof(key));
+        Magic.CopyTo(dst);
+        dst[MagicLen] = (byte)version;
+        BinaryPrimitives.WriteInt32BigEndian(dst.Slice(MagicLen + 1, IterLen), iter);
+        salt.CopyTo(dst[(MagicLen + 1 + IterLen)..]);
+        ivOrNonce.CopyTo(dst[Prefix..]);
+        wrapped.CopyTo(dst[(Prefix + ivOrNonce.Length)..]);
+    }
 
-        int n = key.Length / 8;
-        var output = new byte[key.Length + 8];
-        Span<byte> r = output.AsSpan(8);   // R[1..n] live in the tail; A[0..8] filled at the end
-        key.CopyTo(r);
-
-        ulong a = DefaultIv;
+    private static byte[] WrapDek(ReadOnlySpan<byte> kek, ReadOnlySpan<byte> dek)
+    {
         using var aes = Aes.Create();
         aes.Key = kek.ToArray();
-
-        Span<byte> block = stackalloc byte[16];
-        for (int j = 0; j < 6; j++)
-        {
-            for (int i = 1; i <= n; i++)
-            {
-                Span<byte> ri = r.Slice((i - 1) * 8, 8);
-                BinaryPrimitives.WriteUInt64BigEndian(block[..8], a);
-                ri.CopyTo(block[8..]);
-
-                aes.EncryptEcb(block, block, PaddingMode.None);
-
-                a = BinaryPrimitives.ReadUInt64BigEndian(block[..8]) ^ (ulong)(n * j + i);
-                block[8..].CopyTo(ri);
-            }
-        }
-
-        BinaryPrimitives.WriteUInt64BigEndian(output.AsSpan(0, 8), a);
-        return output;
+        return aes.EncryptKeyWrapPadded(dek);
     }
 
-    public static byte[] Unwrap(ReadOnlySpan<byte> kek, ReadOnlySpan<byte> wrapped)
+    private static byte[] UnwrapDek(ReadOnlySpan<byte> kek, ReadOnlySpan<byte> wrapped)
     {
-        if (wrapped.Length < 24 || wrapped.Length % 8 != 0)
-            throw new ArgumentException("Wrapped key must be a multiple of 8 bytes and at least 24.", nameof(wrapped));
-
-        int n = wrapped.Length / 8 - 1;
-        var output = new byte[n * 8];
-        Span<byte> r = output;
-        wrapped[8..].CopyTo(r);
-
-        ulong a = BinaryPrimitives.ReadUInt64BigEndian(wrapped[..8]);
         using var aes = Aes.Create();
         aes.Key = kek.ToArray();
-
-        Span<byte> block = stackalloc byte[16];
-        for (int j = 5; j >= 0; j--)
-        {
-            for (int i = n; i >= 1; i--)
-            {
-                Span<byte> ri = r.Slice((i - 1) * 8, 8);
-                BinaryPrimitives.WriteUInt64BigEndian(block[..8], a ^ (ulong)(n * j + i));
-                ri.CopyTo(block[8..]);
-
-                aes.DecryptEcb(block, block, PaddingMode.None);
-
-                a = BinaryPrimitives.ReadUInt64BigEndian(block[..8]);
-                block[8..].CopyTo(ri);
-            }
-        }
-
-        if (a != DefaultIv)
-        {
-            CryptographicOperations.ZeroMemory(output);
-            throw new CryptographicException("AES-KW integrity check failed — wrong KEK or corrupted wrapped key.");
-        }
-        return output;
+        return aes.DecryptKeyWrapPadded(wrapped);
     }
-}
-
-/// <summary>Minimal forward-only writer over a span; keeps blob assembly readable.</summary>
-file ref struct SpanWriter(Span<byte> buffer)
-{
-    private readonly Span<byte> _buffer = buffer;
-    private int _pos;
-
-    public void Byte(byte value) => _buffer[_pos++] = value;
-
-    public void Int32(int value)
-    {
-        BinaryPrimitives.WriteInt32BigEndian(_buffer.Slice(_pos, 4), value);
-        _pos += 4;
-    }
-
-    // 'scoped' promises the span is only read here (it is — we copy out of it),
-    // so passing a stackalloc'd argument doesn't violate ref-safety.
-    public void Write(scoped ReadOnlySpan<byte> data)
-    {
-        data.CopyTo(_buffer[_pos..]);
-        _pos += data.Length;
-    }
-}
-
-/// <summary>Minimal forward-only reader over a span.</summary>
-file ref struct SpanReader(ReadOnlySpan<byte> buffer)
-{
-    private readonly ReadOnlySpan<byte> _buffer = buffer;
-    private int _pos;
-
-    public ReadOnlySpan<byte> Take(int count)
-    {
-        var slice = _buffer.Slice(_pos, count);
-        _pos += count;
-        return slice;
-    }
-
-    public readonly ReadOnlySpan<byte> Rest => _buffer[_pos..];
 }

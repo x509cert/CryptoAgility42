@@ -42,12 +42,13 @@ static int Run(string[] args)
 
 static int EncryptFile(string[] args)
 {
-    if (args.Length != 4)
-        return UsageError("encrypt requires: <v1|v2|v3> <password> <filename>");
+    if (args.Length is not (3 or 4))
+        return UsageError("encrypt requires: [v1|v2|v3] <password> <filename>");
 
-    CryptoVersion version = ParseVersion(args[1]);
-    string password = args[2];
-    string inputPath = args[3];
+    bool versionSpecified = args.Length == 4;
+    CryptoVersion version = versionSpecified ? ParseVersion(args[1]) : CryptoVersion.Latest;
+    string password = versionSpecified ? args[2] : args[1];
+    string inputPath = versionSpecified ? args[3] : args[2];
     string outputPath = inputPath + ".enc";
 
     if (!File.Exists(inputPath))
@@ -158,12 +159,13 @@ static void PrintUsage()
 {
     Console.Error.WriteLine("""
         Usage:
-          Crypto encrypt <v1|v2|v3> <password> <filename>
+          Crypto encrypt [v1|v2|v3] <password> <filename>
           Crypto decrypt <password> <filename.enc>
           Crypto inspect <filename.enc>
 
         encrypt writes <filename>.enc and stores the format magic, version, PBKDF2
         iteration count, salt, IV or nonce, wrapped DEK, ciphertext, and auth tag.
+        When the version is omitted, encrypt uses the latest supported version.
         decrypt writes the original filename by removing
         the .enc suffix, or appends .dec when the input name does not end in .enc.
         inspect prints the public crypto header metadata without decrypting.
